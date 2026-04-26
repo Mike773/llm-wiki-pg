@@ -262,16 +262,31 @@ def cmd_ask(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="rag_v7_wiki ingest/query CLI шаблон")
-    parser.add_argument(
+    # Общие флаги — через parents=, чтобы --dsn и --direction работали
+    # как до, так и после имени subcommand-а.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
         "--dsn",
         default=None,
         help="Postgres DSN (по умолчанию — env DATABASE_URL).",
     )
-    parser.add_argument("--direction", default="research", help="ключ направления (default: research).")
+    common.add_argument(
+        "--direction",
+        default="research",
+        help="ключ направления (default: research).",
+    )
+
+    parser = argparse.ArgumentParser(
+        description="rag_v7_wiki ingest/query CLI шаблон",
+        parents=[common],
+    )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_ingest = sub.add_parser("ingest", help="загрузить и обработать один документ")
+    p_ingest = sub.add_parser(
+        "ingest",
+        parents=[common],
+        help="загрузить и обработать один документ",
+    )
     p_ingest.add_argument("text", nargs="?", default=None)
     p_ingest.add_argument("--from-file", default=None)
     p_ingest.add_argument("--external-id", default=None)
@@ -282,11 +297,19 @@ def main() -> None:
     )
     p_ingest.set_defaults(func=cmd_ingest)
 
-    p_pending = sub.add_parser("pending", help="обработать все pending документы направления")
+    p_pending = sub.add_parser(
+        "pending",
+        parents=[common],
+        help="обработать все pending документы направления",
+    )
     p_pending.add_argument("--limit", type=int, default=10)
     p_pending.set_defaults(func=cmd_pending)
 
-    p_ask = sub.add_parser("ask", help="спросить вики")
+    p_ask = sub.add_parser(
+        "ask",
+        parents=[common],
+        help="спросить вики",
+    )
     p_ask.add_argument("question")
     p_ask.add_argument("--no-embeddings", action="store_true", help="режим wiki-only (без эмбеддингов)")
     p_ask.add_argument("--graph", action="store_true", help="включить 1-hop graph expansion")
