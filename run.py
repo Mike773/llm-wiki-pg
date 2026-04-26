@@ -101,13 +101,21 @@ class _EmbedderAdapter:
         return [get_embedding(t) for t in texts]
 
 
+STRUCTURED_MAX_ATTEMPTS = 3            # 1 первая + 2 retry
+STRUCTURED_ECHO_RAW_CHARS = 1500       # сколько прошлого ответа LLM показать обратно
+STRUCTURED_DEBUG = True                # печатать неудачные попытки в stderr
+
+
 class _LLMAdapter:
     """Оборачивает get_llm в LLM-протокол.
 
     `complete()` — прямой проброс.
-    `structured()` — JSON-mode prompting: добавляем JSON-schema к user-промпту,
-    парсим ответ как JSON, валидируем pydantic-ом. До 2 попыток (с указанием
-    ошибки во второй).
+    `structured()` — JSON-mode prompting:
+      - добавляем JSON-schema к user-промпту,
+      - парсим ответ через _extract_json (raw_decode-based, устойчивый),
+      - валидируем pydantic-ом,
+      - при провале — следующая попытка получает ПОЛНЫЙ pydantic-ошибки
+        и обрезанный echo собственного предыдущего ответа.
     """
 
     model_name = LLM_MODEL_NAME
@@ -120,43 +128,79 @@ class _LLMAdapter:
         suffix = (
             "\n\n=== STRICT OUTPUT FORMAT ===\n"
             "Верни ровно один JSON-объект, соответствующий схеме ниже. "
-            "Никакого текста вне JSON. Никаких ```...``` обёрток.\n"
+            "Никакого текста вне JSON. Никаких ```...``` обёрток. "
+            "Все строки внутри JSON правильно экранируй (\\n, \\\", \\\\).\n"
             f"JSON Schema:\n{json_schema}"
         )
-        last_error = ""
-        for _ in range(2):
-            prompt = user + suffix + (
-                f"\n\n(Предыдущая попытка была невалидна: {last_error}. Исправь.)"
-                if last_error
-                else ""
-            )
+
+        last_error: str = ""
+        last_raw: str = ""
+        for attempt in range(1, STRUCTURED_MAX_ATTEMPTS + 1):
+            prompt = user + suffix
+            if last_error:
+                prompt += (
+                    "\n\n=== ПРЕДЫДУЩАЯ ПОПЫТКА БЫЛА НЕВАЛИДНОЙ ===\n"
+                    "Твой прошлый ответ:\n"
+                    "<<<\n"
+                    f"{last_raw[:STRUCTURED_ECHO_RAW_CHARS]}"
+                    f"{'…(echo обрезан)' if len(last_raw) > STRUCTURED_ECHO_RAW_CHARS else ''}\n"
+                    ">>>\n\n"
+                    "Ошибка валидации:\n"
+                    f"{last_error}\n\n"
+                    "Верни новый, ИСПРАВЛЕННЫЙ JSON, соответствующий схеме."
+                )
             raw = get_llm(system, prompt)
             try:
                 return schema.model_validate(_extract_json(raw))
             except Exception as exc:
-                last_error = str(exc)[:300]
+                last_error = str(exc)
+                last_raw = raw or ""
+                if STRUCTURED_DEBUG:
+                    print(
+                        f"\n[_LLMAdapter.structured] attempt {attempt}/{STRUCTURED_MAX_ATTEMPTS} "
+                        f"failed for {schema.__name__}:\n"
+                        f"  error: {last_error[:500]}\n"
+                        f"  raw  : {last_raw[:500]!r}",
+                        file=sys.stderr,
+                    )
         raise RuntimeError(
-            f"LLM не вернул валидный {schema.__name__} за 2 попытки: {last_error}"
+            f"LLM не вернул валидный {schema.__name__} за "
+            f"{STRUCTURED_MAX_ATTEMPTS} попыток.\n"
+            f"Последняя ошибка:\n{last_error}\n"
+            f"Последний сырой ответ:\n{last_raw[:1000]!r}"
         )
 
 
-_JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
-
-
 def _extract_json(text: str) -> dict[str, Any]:
-    """Вытаскивает JSON-объект из ответа LLM (с code-fence или без)."""
+    """Вытаскивает первый валидный JSON-объект из ответа LLM.
+
+    Устойчиво к: ```json fence```, тексту до/после JSON, вложенным `{`/`}`
+    в строковых значениях. Использует json.JSONDecoder.raw_decode — он
+    останавливается на конце первого валидного JSON, не ест лишнее.
+    """
     text = (text or "").strip()
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text)
         text = re.sub(r"\s*```$", "", text).strip()
+    # 1) попытка распарсить как есть
     try:
-        return json.loads(text)
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            return obj
     except json.JSONDecodeError:
         pass
-    m = _JSON_OBJECT_RE.search(text)
-    if not m:
-        raise ValueError(f"В ответе LLM не найден JSON-объект: {text[:300]!r}")
-    return json.loads(m.group(0))
+    # 2) ищем первый '{', с которого raw_decode выдаёт валидный объект
+    decoder = json.JSONDecoder()
+    for i, ch in enumerate(text):
+        if ch != "{":
+            continue
+        try:
+            obj, _end = decoder.raw_decode(text[i:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            return obj
+    raise ValueError(f"В ответе LLM не найден JSON-объект: {text[:500]!r}")
 
 
 # -----------------------------------------------------------------------------
