@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from testcontainers.postgres import PostgresContainer
 
 from rag_v7_wiki import WikiConfig, WikiCore
+from rag_v7_wiki.query import _SlugPickResponse, _WikiAnswer
 from rag_v7_wiki.schemas import (
     ClaimsResponse,
     ContradictionResolutionDecision,
@@ -155,6 +156,19 @@ class FakeLLM:
                 issues=[],
                 suggestions=[],
                 needs_resynthesis=False,
+            )
+        if schema is _SlugPickResponse:
+            return _SlugPickResponse(  # type: ignore[return-value]
+                relevant_slugs=[],
+                reasoning="stub picker — overridden in tests",
+            )
+        if schema is _WikiAnswer:
+            return _WikiAnswer(  # type: ignore[return-value]
+                answer="Stub answer based on the provided context.",
+                confidence=0.7,
+                insufficient_evidence=False,
+                cited_page_slugs=[],
+                cited_claim_ids=[],
             )
         raise NotImplementedError(f"FakeLLM не умеет {schema.__name__}")
 
