@@ -13,31 +13,35 @@ deliberately out of scope for this repo.
 
 ## Pipeline
 
-Each document goes through 11 steps inside `WikiCore.process_document`:
+Each document goes through 10 steps inside `WikiCore.process_document`:
 
 1. **redact** — regex-based PII / API-key scrubbing (`[REDACTED:kind:n]`),
    audit trail in `documents.redactions`.
 2. **chunk** + optional **summary** for long documents.
-3. **embed** chunks (and summaries) into pgvector.
-4. **extract entities** with type, aliases, salient attrs, supporting chunks.
-5. **resolve entities** via kNN cosine + LLM arbiter, deduped by canonical name.
-6. **extract claims** as atomic `(subject, predicate, object)` triples
+3. **extract entities** with type, aliases, salient attrs, supporting chunks.
+4. **resolve entities** via kNN cosine + LLM arbiter, deduped by canonical name.
+5. **extract claims** as atomic `(subject, predicate, object)` triples
    with citations.
-7. **normalise predicates** into a controlled per-direction vocabulary
+6. **normalise predicates** into a controlled per-direction vocabulary
    (`canonical_predicates` table).
-8. **supersession + contradiction auto-resolution** — LLM arbiter decides
+7. **supersession + contradiction auto-resolution** — LLM arbiter decides
    `same / supersedes_old / contradiction / orthogonal`. Confident
    contradictions are auto-resolved (`decided_by='auto_arbiter'`),
    uncertain ones stay flagged.
-9. **tier promotion** — claims walk `working → episodic → semantic` based
+8. **tier promotion** — claims walk `working → episodic → semantic` based
    on confirmation count and age.
-10. **synthesise pages** — one per source document (`page_kind='source'`)
-    plus one per affected entity, each through a quality-score pass with
-    optional re-synthesis. Coverage metrics + provenance written to
-    `wiki_pages` and `page_sources`.
-11. **rebuild singleton pages** — `index` (catalogue grouped by page_kind)
+9. **synthesise pages** — one per source document (`page_kind='source'`)
+   plus one per affected entity, each through a quality-score pass with
+   optional re-synthesis. Coverage metrics + provenance written to
+   `wiki_pages` and `page_sources`.
+10. **rebuild singleton pages** — `index` (catalogue grouped by page_kind)
     and `log` (chronological `## [YYYY-MM-DD] ingest | title` entries),
     both materialised as wiki pages from underlying tables.
+
+Vector embeddings are computed only where the ingest itself uses them:
+canonical entity names (resolution), claim text (supersession), canonical
+predicates (normalisation) and final page content. Chunks and document
+summaries are stored as text only — re-embed when retrieval is added.
 
 Confidence updates use a Bayesian noisy-OR rollup
 (`new = 1 − (1−old)·(1−hint)`) so each confirmation moves a claim

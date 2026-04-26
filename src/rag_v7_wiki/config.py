@@ -32,5 +32,3 @@ class WikiConfig:
 
     log_page_recent_entries: int = 200
     pii_strict_mode: bool = False
-
-    embed_batch_size: int = 64

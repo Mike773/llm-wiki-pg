@@ -17,7 +17,6 @@ from rag_v7_wiki.dao.predicates import PredicateDAO
 from rag_v7_wiki.pipeline.chunking import chunk_document, summarize_document
 from rag_v7_wiki.pipeline.claims import extract_claims, store_claims
 from rag_v7_wiki.pipeline.coverage import apply_coverage
-from rag_v7_wiki.pipeline.embedding import embed_document_chunks, embed_summary
 from rag_v7_wiki.pipeline.entities import extract_entities, resolve_and_upsert
 from rag_v7_wiki.pipeline.indexing import rebuild_index_page, rebuild_log_page
 from rag_v7_wiki.pipeline.linking import relink_pages
@@ -205,30 +204,11 @@ class WikiCore:
 
             if needs_chunking and not doc.get("summary"):
                 summary_text = summarize_document(content, self.llm)
-                embed_summary(
-                    direction_key=direction_key,
-                    document_id=doc_id,
-                    summary=summary_text,
-                    embedder=self.embedder,
-                    document_dao=self.documents,
-                )
+                self.documents.set_summary(direction_key, doc_id, summary_text)
                 doc["summary"] = summary_text
             summary = doc.get("summary")
         except Exception as exc:
             raise PipelineError("chunking", exc) from exc
-
-        # STEP 2 — Embedding
-        try:
-            embed_document_chunks(
-                direction_key=direction_key,
-                document_id=doc_id,
-                embedder=self.embedder,
-                chunk_dao=self.chunks,
-                batch_size=self.config.embed_batch_size,
-            )
-            self.documents.set_status(direction_key, doc_id, "embedded")
-        except Exception as exc:
-            raise PipelineError("embedding", exc) from exc
 
         # STEP 3+4 — Entity extraction & resolution
         try:

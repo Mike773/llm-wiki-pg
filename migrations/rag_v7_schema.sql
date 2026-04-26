@@ -93,20 +93,19 @@ CREATE TABLE IF NOT EXISTS rag_v7.directions (
 );
 
 CREATE TABLE IF NOT EXISTS rag_v7.documents (
-    id                 BIGSERIAL PRIMARY KEY,
-    direction_key      TEXT NOT NULL REFERENCES rag_v7.directions(key) ON DELETE CASCADE,
-    external_id        TEXT,
-    content            TEXT NOT NULL,
-    needs_chunking     BOOLEAN NOT NULL DEFAULT false,
-    status             rag_v7.document_status NOT NULL DEFAULT 'pending',
-    failed_step        TEXT,
-    error              TEXT,
-    summary            TEXT,
-    summary_embedding  public.vector(2560),
-    metadata           JSONB NOT NULL DEFAULT '{}'::jsonb,
-    redactions         JSONB NOT NULL DEFAULT '[]'::jsonb,
-    created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
-    processed_at       TIMESTAMPTZ
+    id              BIGSERIAL PRIMARY KEY,
+    direction_key   TEXT NOT NULL REFERENCES rag_v7.directions(key) ON DELETE CASCADE,
+    external_id     TEXT,
+    content         TEXT NOT NULL,
+    needs_chunking  BOOLEAN NOT NULL DEFAULT false,
+    status          rag_v7.document_status NOT NULL DEFAULT 'pending',
+    failed_step     TEXT,
+    error           TEXT,
+    summary         TEXT,
+    metadata        JSONB NOT NULL DEFAULT '{}'::jsonb,
+    redactions      JSONB NOT NULL DEFAULT '[]'::jsonb,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    processed_at    TIMESTAMPTZ
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS documents_direction_external_uniq
@@ -124,7 +123,6 @@ CREATE TABLE IF NOT EXISTS rag_v7.chunks (
     ord            INT NOT NULL,
     content        TEXT NOT NULL,
     length         INT NOT NULL,                            -- длина в символах
-    embedding      public.vector(2560),
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (document_id, ord)
 );

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from rag_v7_wiki.dao.connection import ConnectionManager, to_vec
+from rag_v7_wiki.dao.connection import ConnectionManager
 
 
 class DocumentDAO:
@@ -45,7 +45,7 @@ class DocumentDAO:
             cur.execute(
                 """
                 SELECT id, direction_key, external_id, content, needs_chunking,
-                       status, summary, summary_embedding, metadata, redactions
+                       status, summary, metadata, redactions
                 FROM rag_v7.documents
                 WHERE id = %s AND direction_key = %s;
                 """,
@@ -79,16 +79,15 @@ class DocumentDAO:
         direction_key: str,
         doc_id: int,
         summary: str,
-        summary_embedding: list[float] | None,
     ) -> None:
         with self._cm.conn() as conn, conn.cursor() as cur:
             cur.execute(
                 """
                 UPDATE rag_v7.documents
-                SET summary = %s, summary_embedding = %s
+                SET summary = %s
                 WHERE id = %s AND direction_key = %s;
                 """,
-                (summary, to_vec(summary_embedding), doc_id, direction_key),
+                (summary, doc_id, direction_key),
             )
 
     def set_redacted_content(
