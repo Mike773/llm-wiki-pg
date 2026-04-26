@@ -1,16 +1,17 @@
-"""WikiQuery — выборка ответа из rag_v7_wiki по пользовательскому вопросу.
+"""WikiQuery — самодостаточный модуль выборки для rag_v7_wiki.
 
-Самодостаточный модуль: один публичный класс `WikiQuery`, две приватных
-Pydantic-модели для structured-ответов LLM, всё работает напрямую с
-существующей схемой `rag_v7.*` через `ConnectionManager`. Не требует
-правок в DAO или schemas.py.
+Один публичный класс `WikiQuery` + всё, что ему нужно для работы
+(connection-pool с pgvector, internal Pydantic-схемы для structured-LLM,
+duck-typing-протоколы для Embedder/LLM). Зависит только от внешних
+библиотек: psycopg, psycopg_pool, pgvector, pydantic. Подставляется в
+чужой проект копированием одного файла.
 
 Использование:
 
-    from rag_v7_wiki import WikiQuery
+    from rag_v7_wiki.query import WikiQuery  # либо просто импорт этого файла
 
     with WikiQuery(
-        connection_string=DSN,
+        connection_string="postgresql://user:pass@host/db",
         direction_key="research",
         llm=my_llm,
         embedder=my_embedder,
@@ -23,20 +24,91 @@ Pydantic-модели для structured-ответов LLM, всё работа�
 from __future__ import annotations
 
 import time
-from typing import Any, Literal, TypeVar
+from contextlib import contextmanager
+from typing import Any, Iterator, Protocol, TypeVar, runtime_checkable
 
+import psycopg
+from pgvector import Vector
+from pgvector.psycopg import register_vector
+from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 from pydantic import BaseModel, Field
-
-from rag_v7_wiki.dao.connection import ConnectionManager, to_vec
-from rag_v7_wiki.protocols import LLM, Embedder
 
 T = TypeVar("T", bound=BaseModel)
 
 
 # ---------------------------------------------------------------------------
+# Duck-typed protocols — твои LLM и Embedder должны соответствовать этим
+# интерфейсам (любой класс с такими методами автоматически подходит).
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class Embedder(Protocol):
+    @property
+    def dim(self) -> int: ...
+
+    def embed(self, texts: list[str]) -> list[list[float]]: ...
+
+
+@runtime_checkable
+class LLM(Protocol):
+    def complete(self, system: str, user: str) -> str: ...
+
+    def structured(self, system: str, user: str, schema: type[T]) -> T: ...
+
+    @property
+    def model_name(self) -> str: ...
+
+
+# ---------------------------------------------------------------------------
+# Inline Postgres helpers (без зависимости от rag_v7_wiki.dao.connection).
+# ---------------------------------------------------------------------------
+
+
+def _to_vec(values: list[float] | None) -> Vector | None:
+    return None if values is None else Vector(values)
+
+
+class _ConnectionManager:
+    """Тонкая read-only обёртка над psycopg ConnectionPool с pgvector.
+
+    Принимает либо DSN-строку (создаёт собственный pool, закрывает в close()),
+    либо готовый `ConnectionPool` (тогда внешним владельцем управляем не мы).
+    """
+
+    def __init__(self, dsn_or_pool: str | ConnectionPool):
+        if isinstance(dsn_or_pool, ConnectionPool):
+            self._pool = dsn_or_pool
+            self._owned = False
+        else:
+            self._pool = ConnectionPool(
+                conninfo=dsn_or_pool,
+                min_size=1,
+                max_size=10,
+                kwargs={"row_factory": dict_row},
+                configure=self._configure_connection,
+                open=True,
+            )
+            self._owned = True
+
+    @staticmethod
+    def _configure_connection(conn: psycopg.Connection) -> None:
+        register_vector(conn)
+
+    @contextmanager
+    def conn(self) -> Iterator[psycopg.Connection]:
+        with self._pool.connection() as conn:
+            register_vector(conn)
+            yield conn
+
+    def close(self) -> None:
+        if self._owned:
+            self._pool.close()
+
+
+# ---------------------------------------------------------------------------
 # Internal Pydantic schemas (LLM I/O для retrieval-стадий).
-# Не выносим в schemas.py намеренно, чтобы query.py остался one-file deliverable.
 # ---------------------------------------------------------------------------
 
 
@@ -128,8 +200,7 @@ class WikiQuery:
             raise ValueError(
                 f"tier_floor must be one of {_TIER_ORDER}, got {tier_floor!r}"
             )
-        self.cm = ConnectionManager(connection_string)
-        self._owned_cm = not isinstance(connection_string, ConnectionPool)
+        self._cm = _ConnectionManager(connection_string)
         self.direction_key = direction_key
         self.llm = llm
         self.embedder = embedder
@@ -140,7 +211,9 @@ class WikiQuery:
         self.top_k_claims = top_k_claims
         self.top_k_entities = top_k_entities
         self.min_similarity = min_similarity
-        self.include_page_kinds = list(include_page_kinds) if include_page_kinds else list(_DEFAULT_PAGE_KINDS)
+        self.include_page_kinds = (
+            list(include_page_kinds) if include_page_kinds else list(_DEFAULT_PAGE_KINDS)
+        )
         self.include_superseded = include_superseded
         self.include_flagged_contradictions = include_flagged_contradictions
         self.tier_floor = tier_floor
@@ -157,8 +230,7 @@ class WikiQuery:
         self.close()
 
     def close(self) -> None:
-        if self._owned_cm:
-            self.cm.close()
+        self._cm.close()
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -184,7 +256,6 @@ class WikiQuery:
             context_text = self._compose_context(question, pages, claims, entities, report)
 
             if not context_text.strip() or (not pages and not claims and not entities):
-                # Нечего скармливать LLM — отвечаем «недостаточно данных» детерминированно.
                 report["stages"].append(
                     {"name": "synthesize", "skipped": True, "reason": "empty_context"}
                 )
@@ -480,8 +551,8 @@ class WikiQuery:
     # ------------------------------------------------------------------
 
     def _sql_top_entities(self, embedding: list[float]) -> list[dict[str, Any]]:
-        q = to_vec(embedding)
-        with self.cm.conn() as conn, conn.cursor() as cur:
+        q = _to_vec(embedding)
+        with self._cm.conn() as conn, conn.cursor() as cur:
             cur.execute(
                 """
                 SELECT id, entity_type, canonical_name, salient_attrs,
@@ -498,7 +569,7 @@ class WikiQuery:
         return [r for r in rows if (r.get("similarity") or 0.0) >= self.min_similarity]
 
     def _sql_top_claims(self, embedding: list[float]) -> list[dict[str, Any]]:
-        q = to_vec(embedding)
+        q = _to_vec(embedding)
         statuses: list[str] = ["active"]
         if self.include_flagged_contradictions:
             statuses.append("flagged_contradiction")
@@ -508,7 +579,7 @@ class WikiQuery:
         floor_idx = _TIER_ORDER.index(self.tier_floor)
         tiers = list(_TIER_ORDER[floor_idx:])
 
-        with self.cm.conn() as conn, conn.cursor() as cur:
+        with self._cm.conn() as conn, conn.cursor() as cur:
             cur.execute(
                 """
                 SELECT c.id, c.predicate, c.claim_text, c.confidence,
@@ -532,8 +603,8 @@ class WikiQuery:
         return [r for r in rows if (r.get("similarity") or 0.0) >= self.min_similarity]
 
     def _sql_top_pages(self, embedding: list[float]) -> list[dict[str, Any]]:
-        q = to_vec(embedding)
-        with self.cm.conn() as conn, conn.cursor() as cur:
+        q = _to_vec(embedding)
+        with self._cm.conn() as conn, conn.cursor() as cur:
             cur.execute(
                 """
                 SELECT id, page_kind::text AS page_kind, slug, title, content_md,
@@ -551,7 +622,7 @@ class WikiQuery:
         return [r for r in rows if (r.get("similarity") or 0.0) >= self.min_similarity]
 
     def _sql_get_singleton_content(self, page_kind: str) -> str | None:
-        with self.cm.conn() as conn, conn.cursor() as cur:
+        with self._cm.conn() as conn, conn.cursor() as cur:
             cur.execute(
                 """
                 SELECT content_md FROM rag_v7.wiki_pages
@@ -566,7 +637,7 @@ class WikiQuery:
     def _sql_pages_by_slug(self, slugs: list[str]) -> list[dict[str, Any]]:
         if not slugs:
             return []
-        with self.cm.conn() as conn, conn.cursor() as cur:
+        with self._cm.conn() as conn, conn.cursor() as cur:
             cur.execute(
                 """
                 SELECT id, page_kind::text AS page_kind, slug, title, content_md,
@@ -581,7 +652,7 @@ class WikiQuery:
     def _sql_graph_neighbors(self, seed_ids: list[int]) -> list[int]:
         if not seed_ids:
             return []
-        with self.cm.conn() as conn, conn.cursor() as cur:
+        with self._cm.conn() as conn, conn.cursor() as cur:
             cur.execute(
                 """
                 WITH seed AS (SELECT unnest(%s::bigint[]) AS id)
@@ -601,7 +672,7 @@ class WikiQuery:
     def _sql_pages_for_entities(self, entity_ids: list[int]) -> list[dict[str, Any]]:
         if not entity_ids:
             return []
-        with self.cm.conn() as conn, conn.cursor() as cur:
+        with self._cm.conn() as conn, conn.cursor() as cur:
             cur.execute(
                 """
                 SELECT id, page_kind::text AS page_kind, slug, title, content_md,
