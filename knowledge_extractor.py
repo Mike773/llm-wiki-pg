@@ -5,8 +5,7 @@
 LLM **НЕ отвечает** на инструкцию — только формирует подсказку из фактов.
 
 Модуль самодостаточен: один файл, никаких импортов из rag_v7_wiki. Зависимости —
-только внешние библиотеки: psycopg, pydantic. Можно скопировать во внешний
-проект и пользоваться, передав свои llm/embedder/DSN.
+только внешние библиотеки: psycopg, pydantic.
 
 NB: PostgreSQL должна иметь установленное расширение pgvector (на стороне БД),
 чтобы тип `vector(2560)` и оператор `<=>` существовали. Это не Python-зависимость.
@@ -15,7 +14,19 @@ NB: PostgreSQL должна иметь установленное расшире
 
     from knowledge_extractor import KnowledgeExtractor
 
-    with KnowledgeExtractor(my_llm, my_embedder, "postgresql://...") as kx:
+    def get_embedding(text: str) -> list[float]:
+        return openai_client.embeddings.create(...).data[0].embedding
+
+    def get_llm(system_prompt: str, prompt: str) -> str:
+        return openai_client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt},
+            ],
+            ...
+        ).choices[0].message.content
+
+    with KnowledgeExtractor(get_llm, get_embedding, "postgresql://...") as kx:
         result = kx.extract(
             direction_key="research",
             position_or_role="руководитель отдела продаж",
@@ -23,6 +34,14 @@ NB: PostgreSQL должна иметь установленное расшире
         )
         print(result["answer"])
         print(result["trace"])
+
+Конструктор принимает две callable:
+    - get_llm(system_prompt, prompt) -> str       — обычный текстовый ответ;
+    - get_embedding(text) -> list[float]          — эмбеддинг одной строки.
+
+Структурированный JSON-вывод эмулируется ВНУТРИ модуля: к user-промпту
+докладывается JSON-схема, ответ парсится через raw_decode, валидируется через
+pydantic; при ошибке — до 3-х повторов с echo предыдущего ответа.
 
 Pipeline:
     1) Найти наиболее релевантную сущность (entity) под position_or_role:
@@ -43,15 +62,18 @@ Pipeline:
     - "trace":  numbered narrative «как получили и откуда» (markdown).
 
 Вся выборка фильтруется по direction_key. Embeddings ожидаются 2560-мерные
-(жёсткое требование схемы rag_v7).
+(жёсткое требование схемы rag_v7) — проверки в Python нет, ошибка прилетит из
+psycopg/pgvector на первом cosine-запросе.
 """
 
 from __future__ import annotations
 
+import json
+import re
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any, Iterator, Protocol, TypeVar, runtime_checkable
+from typing import Any, Callable, Iterator, TypeVar
 
 import psycopg
 from psycopg.rows import dict_row
@@ -61,27 +83,16 @@ T = TypeVar("T", bound=BaseModel)
 
 
 # ---------------------------------------------------------------------------
-# Duck-typed protocols — твои LLM и Embedder должны соответствовать этим
-# интерфейсам (любой класс с такими методами автоматически подходит).
+# Type aliases для callable-зависимостей. Никаких protocol-классов —
+# пользователь просто передаёт свои функции.
 # ---------------------------------------------------------------------------
 
 
-@runtime_checkable
-class Embedder(Protocol):
-    @property
-    def dim(self) -> int: ...
+GetLLM = Callable[[str, str], str]
+"""(system_prompt, prompt) -> response text — обычный chat-completion вызов."""
 
-    def embed(self, texts: list[str]) -> list[list[float]]: ...
-
-
-@runtime_checkable
-class LLM(Protocol):
-    def complete(self, system: str, user: str) -> str: ...
-
-    def structured(self, system: str, user: str, schema: type[T]) -> T: ...
-
-    @property
-    def model_name(self) -> str: ...
+GetEmbedding = Callable[[str], list[float]]
+"""(text) -> embedding vector — эмбеддинг ОДНОЙ строки за вызов."""
 
 
 # ---------------------------------------------------------------------------
@@ -131,10 +142,43 @@ class _ConnectionManager:
 # ---------------------------------------------------------------------------
 
 
-_EXPECTED_EMBEDDING_DIM = 2560
 _DEFAULT_PAGE_KINDS = ("entity", "source", "concept", "comparison", "overview", "index")
 _TIER_SCORE_MAP = {"working": 0.0, "episodic": 0.4, "semantic": 0.7, "procedural": 1.0}
 _ACTIVE_STATUSES = ("active", "flagged_contradiction")
+
+# --- structured() эмуляция (мирроринг run.py:_LLMAdapter.structured)
+_STRUCTURED_MAX_ATTEMPTS = 3        # 1 первая + 2 retry
+_STRUCTURED_ECHO_RAW_CHARS = 1500   # сколько прошлого ответа показывать LLM назад
+
+
+def _extract_json(text: str) -> dict[str, Any]:
+    """Вытаскивает первый валидный JSON-объект из ответа LLM.
+
+    Устойчиво к: ```json fence```, тексту до/после JSON, вложенным `{`/`}`
+    в строковых значениях. Использует json.JSONDecoder.raw_decode — он
+    останавливается на конце первого валидного JSON, не ест лишнее.
+    """
+    text = (text or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text).strip()
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            return obj
+    except json.JSONDecodeError:
+        pass
+    decoder = json.JSONDecoder()
+    for i, ch in enumerate(text):
+        if ch != "{":
+            continue
+        try:
+            obj, _end = decoder.raw_decode(text[i:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            return obj
+    raise ValueError(f"В ответе LLM не найден JSON-объект: {text[:500]!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -330,10 +374,12 @@ class KnowledgeExtractor:
 
     def __init__(
         self,
-        llm: LLM,
-        embedder: Embedder,
+        get_llm: GetLLM,
+        get_embedding: GetEmbedding,
         db_connection_string: str,
         *,
+        # diagnostic
+        llm_label: str = "external",
         # entity-resolution
         entity_top_k: int = 8,
         entity_min_similarity: float = 0.25,
@@ -402,23 +448,17 @@ class KnowledgeExtractor:
             raise ValueError(
                 f"recency_half_life_days must be > 0, got {recency_half_life_days}"
             )
+        if not callable(get_llm):
+            raise TypeError("get_llm must be callable: (system_prompt, prompt) -> str")
+        if not callable(get_embedding):
+            raise TypeError("get_embedding must be callable: (text) -> list[float]")
 
-        # Embedder dim hard requirement (схема pgvector vector(2560))
-        try:
-            actual_dim = embedder.dim
-        except Exception as exc:  # noqa: BLE001
-            raise ValueError(
-                "embedder.dim must be readable; got exception: " + repr(exc)
-            ) from exc
-        if actual_dim != _EXPECTED_EMBEDDING_DIM:
-            raise ValueError(
-                f"This module targets vector({_EXPECTED_EMBEDDING_DIM}) columns; "
-                f"embedder.dim={actual_dim}. Either re-embed your DB at "
-                f"{_EXPECTED_EMBEDDING_DIM} dims or change vector column types."
-            )
+        # NB: проверка размерности эмбеддинга НЕ делается тут — pgvector сам
+        # выкинет ошибку на первом cosine-запросе, если dim != 2560.
 
-        self.llm = llm
-        self.embedder = embedder
+        self._get_llm = get_llm
+        self._get_embedding = get_embedding
+        self._llm_label = llm_label
         self._cm = _ConnectionManager(db_connection_string)
 
         self.entity_top_k = entity_top_k
@@ -463,6 +503,57 @@ class KnowledgeExtractor:
 
     def close(self) -> None:
         self._cm.close()
+
+    # ------------------------------------------------------------------
+    # Structured-output эмуляция поверх get_llm() (мирроринг run.py).
+    # ------------------------------------------------------------------
+
+    def _call_structured(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        schema: type[T],
+    ) -> T:
+        """Вызывает get_llm с дополненным JSON-schema промптом, парсит ответ.
+
+        При неудаче валидации — до _STRUCTURED_MAX_ATTEMPTS попыток с echo
+        предыдущего ответа + полной pydantic-ошибкой.
+        """
+        json_schema = json.dumps(schema.model_json_schema(), ensure_ascii=False)
+        suffix = (
+            "\n\n=== STRICT OUTPUT FORMAT ===\n"
+            "Верни ровно один JSON-объект, соответствующий схеме ниже. "
+            "Никакого текста вне JSON. Никаких ```...``` обёрток. "
+            "Все строки внутри JSON правильно экранируй (\\n, \\\", \\\\).\n"
+            f"JSON Schema:\n{json_schema}"
+        )
+
+        last_error: str = ""
+        last_raw: str = ""
+        for _attempt in range(1, _STRUCTURED_MAX_ATTEMPTS + 1):
+            prompt = user_prompt + suffix
+            if last_error:
+                prompt += (
+                    "\n\n=== ПРЕДЫДУЩАЯ ПОПЫТКА БЫЛА НЕВАЛИДНОЙ ===\n"
+                    "Твой прошлый ответ:\n<<<\n"
+                    f"{last_raw[:_STRUCTURED_ECHO_RAW_CHARS]}"
+                    f"{'…(echo обрезан)' if len(last_raw) > _STRUCTURED_ECHO_RAW_CHARS else ''}\n"
+                    ">>>\n\nОшибка валидации:\n"
+                    f"{last_error}\n\n"
+                    "Верни новый, ИСПРАВЛЕННЫЙ JSON, соответствующий схеме."
+                )
+            raw = self._get_llm(system_prompt, prompt)
+            try:
+                return schema.model_validate(_extract_json(raw))
+            except Exception as exc:  # noqa: BLE001
+                last_error = str(exc)
+                last_raw = raw or ""
+        raise RuntimeError(
+            f"LLM не вернул валидный {schema.__name__} за "
+            f"{_STRUCTURED_MAX_ATTEMPTS} попыток.\n"
+            f"Последняя ошибка:\n{last_error}\n"
+            f"Последний сырой ответ:\n{last_raw[:1000]!r}"
+        )
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -515,7 +606,7 @@ class KnowledgeExtractor:
             # --- 5. Embed instruction
             instr_emb: list[float] | None = None
             try:
-                [instr_emb] = self.embedder.embed([instruction])
+                instr_emb = self._get_embedding(instruction)
                 trace.append(
                     "## 5. Embed instruction\n"
                     f"- dim: {len(instr_emb)}"
@@ -639,7 +730,7 @@ class KnowledgeExtractor:
 
         # Step 2: embed
         try:
-            [role_emb] = self.embedder.embed([position_or_role])
+            role_emb = self._get_embedding(position_or_role)
         except Exception as exc:  # noqa: BLE001
             trace.append(
                 "## 2. Embed position_or_role\n"
@@ -684,9 +775,9 @@ class KnowledgeExtractor:
         # Step 4: LLM arbitration
         arbiter_prompt = self._build_arbiter_prompt(position_or_role, candidates)
         candidate_ids = {int(c["id"]) for c in candidates}
-        model_name = getattr(self.llm, "model_name", "unknown")
+        model_name = self._llm_label
         try:
-            decision = self.llm.structured(
+            decision = self._call_structured(
                 _ENTITY_ARBITER_SYSTEM, arbiter_prompt, _EntityArbiterResponse
             )
         except Exception as exc:  # noqa: BLE001
@@ -1146,7 +1237,7 @@ class KnowledgeExtractor:
                 by_id[int(r["id"])] = r
 
         hints: list[dict[str, Any]] = []
-        model_name = getattr(self.llm, "model_name", "unknown")
+        model_name = self._llm_label
         sub_lines: list[str] = [f"- pairs found: {len(pairs)} (model: {model_name})"]
 
         for pair in pairs[: self.contradiction_arbiter_max_pairs]:
@@ -1156,7 +1247,7 @@ class KnowledgeExtractor:
                 continue
             prompt = self._build_contradiction_prompt(a, b)
             try:
-                decision = self.llm.structured(
+                decision = self._call_structured(
                     _CONTRADICTION_ARBITER_SYSTEM,
                     prompt,
                     _ContradictionArbiterResponse,
@@ -1444,8 +1535,8 @@ class KnowledgeExtractor:
             + "Сформируй context_summary, key_facts (с ссылками [[slug]]/claim:N/chunk:N) "
             + "и coverage_notes. НЕ отвечай на instruction."
         )
-        model_name = getattr(self.llm, "model_name", "unknown")
-        synth = self.llm.structured(
+        model_name = self._llm_label
+        synth = self._call_structured(
             _KNOWLEDGE_SYNTHESIS_SYSTEM, user_prompt, _KnowledgeContextResponse
         )
         trace.append(
