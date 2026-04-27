@@ -144,13 +144,21 @@ _DEFAULT_PAGE_KINDS = ("entity", "source", "concept", "comparison", "overview", 
 _ANSWER_SYSTEM = (
     "Ты отвечаешь на вопрос пользователя строго по предоставленному контексту "
     "из knowledge wiki. Правила:\n"
-    "- Используй только факты из RELEVANT PAGES и RELEVANT CLAIMS.\n"
-    "- Если контекста недостаточно — выставь insufficient_evidence=true и "
-    "честно объясни, чего не хватает.\n"
-    "- Цитируй страницы как [[slug]] и claim-ы как claim:N (числовой id).\n"
-    "- Если видишь flagged_contradiction — упомяни оба варианта, не выбирай "
+    "- Используй только факты из контекста.\n"
+    "- Цитируй конкретику ДОСЛОВНО: имена, цифры, даты, формулировки, цитаты. "
+    "НЕ заменяй детали общими формулировками. Если в источнике написано "
+    "«23.4% в Q3 2025» — пиши именно так, а не «существенный рост».\n"
+    "- Если есть секция SOURCE EXCERPTS — это сырой текст документов; ему "
+    "приоритет над пересказами в RELEVANT PAGES.\n"
+    "- RELEVANT CLAIMS — это атомарные тройки, выжимка; используй их для "
+    "ориентации, но детали бери из страниц и SOURCE EXCERPTS.\n"
+    "- Если контекста реально недостаточно — выставь insufficient_evidence=true "
+    "и объясни, чего не хватает.\n"
+    "- Цитируй страницы как [[slug]], claim-ы как claim:N, чанки как chunk:N.\n"
+    "- Если видишь flagged_contradiction — приведи оба варианта, не выбирай "
     "произвольно.\n"
-    "- Будь сжат: один-два абзаца обычно достаточно."
+    "- Длина ответа пропорциональна объёму найденных деталей: коротко — "
+    "только если данных мало."
 )
 
 
@@ -178,6 +186,7 @@ class WikiQuery:
         # retrieval scope
         use_embeddings: bool = True,
         include_graph_expansion: bool = False,
+        include_source_chunks: bool = False,
         # top-K
         top_k_pages: int = 5,
         top_k_claims: int = 10,
@@ -189,12 +198,15 @@ class WikiQuery:
         include_flagged_contradictions: bool = True,
         tier_floor: str = "working",
         # context budget
-        max_context_chars: int = 12000,
+        max_context_chars: int = 20000,
         max_pages_in_context: int = 8,
         max_claims_in_context: int = 30,
-        max_chars_per_page: int = 2500,
+        max_chars_per_page: int = 5000,
+        max_source_chunks: int = 8,
+        max_chars_per_source_chunk: int = 2000,
         # response
         require_citations: bool = True,
+        extra_instructions: str | None = None,
     ) -> None:
         if tier_floor not in _TIER_ORDER:
             raise ValueError(
@@ -207,6 +219,7 @@ class WikiQuery:
 
         self.use_embeddings = use_embeddings
         self.include_graph_expansion = include_graph_expansion
+        self.include_source_chunks = include_source_chunks
         self.top_k_pages = top_k_pages
         self.top_k_claims = top_k_claims
         self.top_k_entities = top_k_entities
@@ -221,7 +234,10 @@ class WikiQuery:
         self.max_pages_in_context = max_pages_in_context
         self.max_claims_in_context = max_claims_in_context
         self.max_chars_per_page = max_chars_per_page
+        self.max_source_chunks = max_source_chunks
+        self.max_chars_per_source_chunk = max_chars_per_source_chunk
         self.require_citations = require_citations
+        self.extra_instructions = extra_instructions
 
     def __enter__(self) -> "WikiQuery":
         return self
@@ -249,13 +265,20 @@ class WikiQuery:
         answer: str | None = None
         try:
             if self.use_embeddings:
-                pages, claims, entities = self._retrieve_with_embeddings(question, report)
+                pages, claims, entities, source_chunks = self._retrieve_with_embeddings(
+                    question, report
+                )
             else:
                 pages, claims, entities = self._retrieve_wiki_only(question, report)
+                source_chunks = []
 
-            context_text = self._compose_context(question, pages, claims, entities, report)
+            context_text = self._compose_context(
+                question, pages, claims, entities, source_chunks, report
+            )
 
-            if not context_text.strip() or (not pages and not claims and not entities):
+            if not context_text.strip() or (
+                not pages and not claims and not entities and not source_chunks
+            ):
                 report["stages"].append(
                     {"name": "synthesize", "skipped": True, "reason": "empty_context"}
                 )
@@ -298,7 +321,7 @@ class WikiQuery:
 
     def _retrieve_with_embeddings(
         self, question: str, report: dict[str, Any]
-    ) -> tuple[list[dict], list[dict], list[dict]]:
+    ) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
         [embedding] = self.embedder.embed([question])
         report["stages"].append({"name": "embed_query", "dim": len(embedding)})
 
@@ -377,7 +400,21 @@ class WikiQuery:
         else:
             report["stages"].append({"name": "graph_expansion", "skipped": True})
 
-        return pages, claims, entities
+        source_chunks: list[dict] = []
+        if self.include_source_chunks and claims:
+            claim_ids = [c["id"] for c in claims]
+            source_chunks = self._sql_chunks_for_claims(claim_ids)
+            report["stages"].append(
+                {
+                    "name": "retrieve_source_chunks",
+                    "count": len(source_chunks),
+                    "chunk_ids": [c["chunk_id"] for c in source_chunks],
+                }
+            )
+        else:
+            report["stages"].append({"name": "retrieve_source_chunks", "skipped": True})
+
+        return pages, claims, entities, source_chunks
 
     # ------------------------------------------------------------------
     # Retrieval — wiki-only mode
@@ -439,12 +476,14 @@ class WikiQuery:
         pages: list[dict],
         claims: list[dict],
         entities: list[dict],
+        source_chunks: list[dict],
         report: dict[str, Any],
     ) -> str:
         budget = self.max_context_chars
         chunks: list[str] = []
         included_page_ids: list[int] = []
         included_claim_ids: list[int] = []
+        included_chunk_ids: list[int] = []
 
         chunks.append(f"QUESTION:\n{question}\n")
 
@@ -468,6 +507,39 @@ class WikiQuery:
                 chunks.append(block)
                 budget -= len(block)
                 included_page_ids.append(page["id"])
+
+        if source_chunks and budget > 0:
+            chunks.append("\nSOURCE EXCERPTS (raw cited text — приоритет над пересказами):")
+            seen_chunks: set[int] = set()
+            citations_per_chunk: dict[int, list[int]] = {}
+            for sc in source_chunks:
+                citations_per_chunk.setdefault(sc["chunk_id"], []).append(sc["claim_id"])
+            for sc in source_chunks[: self.max_source_chunks]:
+                if budget <= 0:
+                    break
+                cid = sc["chunk_id"]
+                if cid in seen_chunks:
+                    continue
+                seen_chunks.add(cid)
+                content = (sc.get("content") or "").strip()
+                if len(content) > self.max_chars_per_source_chunk:
+                    content = (
+                        content[: self.max_chars_per_source_chunk].rstrip()
+                        + "\n…(truncated)"
+                    )
+                cited_by = ", ".join(
+                    f"claim:{c}" for c in citations_per_chunk.get(cid, [])
+                )
+                header = (
+                    f"\n### chunk:{cid} (doc={sc.get('document_id')}; "
+                    f"cited by {cited_by})"
+                )
+                block = header + "\n" + content
+                if len(block) > budget:
+                    block = block[:budget].rstrip() + "\n…(budget cut)"
+                chunks.append(block)
+                budget -= len(block)
+                included_chunk_ids.append(cid)
 
         if claims and budget > 0:
             chunks.append("\nRELEVANT CLAIMS:")
@@ -512,6 +584,7 @@ class WikiQuery:
                 "context_chars": len(text),
                 "page_ids": included_page_ids,
                 "claim_ids": included_claim_ids,
+                "chunk_ids": included_chunk_ids,
                 "budget_remaining": max(0, budget),
             }
         )
@@ -527,9 +600,14 @@ class WikiQuery:
         instructions: list[str] = []
         if self.require_citations:
             instructions.append(
-                "Цитируй страницы как [[slug]] и claim-ы как claim:N — без них ответ "
-                "не считается полным."
+                "Цитируй страницы как [[slug]], claim-ы как claim:N, чанки как "
+                "chunk:N — без цитат ответ не считается полным."
             )
+        if self.extra_instructions:
+            for line in self.extra_instructions.strip().splitlines():
+                line = line.strip()
+                if line:
+                    instructions.append(line.lstrip("-").strip())
 
         user_prompt = context
         if instructions:
@@ -669,6 +747,33 @@ class WikiQuery:
             rows = cur.fetchall()
         return [r["neighbor_id"] for r in rows if r["neighbor_id"] is not None]
 
+    def _sql_chunks_for_claims(self, claim_ids: list[int]) -> list[dict[str, Any]]:
+        """Достаёт сырые чанки для топ-claim-ов через claim_citations.
+
+        Возвращает строки в порядке релевантности (первая встреча claim-а из
+        списка → первый чанк). Сортируем по позиции claim_id во входном
+        списке, чтобы наиболее релевантные claim-ы давали свои чанки раньше.
+        """
+        if not claim_ids:
+            return []
+        with self._cm.conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT cc.claim_id, ch.id AS chunk_id, ch.content,
+                       ch.document_id, ch.ord
+                FROM rag_v7.claim_citations cc
+                JOIN rag_v7.chunks ch ON ch.id = cc.chunk_id
+                WHERE cc.direction_key = %s AND cc.claim_id = ANY(%s)
+                ORDER BY ch.id;
+                """,
+                (self.direction_key, claim_ids),
+            )
+            rows = cur.fetchall()
+        # Перепаковываем по порядку приоритета claim-ов: ранг claim_id в claim_ids
+        rank = {cid: i for i, cid in enumerate(claim_ids)}
+        rows.sort(key=lambda r: (rank.get(r["claim_id"], 1_000_000), r["chunk_id"]))
+        return rows
+
     def _sql_pages_for_entities(self, entity_ids: list[int]) -> list[dict[str, Any]]:
         if not entity_ids:
             return []
@@ -694,6 +799,7 @@ class WikiQuery:
         return {
             "use_embeddings": self.use_embeddings,
             "include_graph_expansion": self.include_graph_expansion,
+            "include_source_chunks": self.include_source_chunks,
             "top_k_pages": self.top_k_pages,
             "top_k_claims": self.top_k_claims,
             "top_k_entities": self.top_k_entities,
@@ -706,5 +812,8 @@ class WikiQuery:
             "max_pages_in_context": self.max_pages_in_context,
             "max_claims_in_context": self.max_claims_in_context,
             "max_chars_per_page": self.max_chars_per_page,
+            "max_source_chunks": self.max_source_chunks,
+            "max_chars_per_source_chunk": self.max_chars_per_source_chunk,
             "require_citations": self.require_citations,
+            "extra_instructions": self.extra_instructions,
         }
