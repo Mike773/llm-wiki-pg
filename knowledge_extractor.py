@@ -5,8 +5,11 @@
 LLM **НЕ отвечает** на инструкцию — только формирует подсказку из фактов.
 
 Модуль самодостаточен: один файл, никаких импортов из rag_v7_wiki. Зависимости —
-только внешние библиотеки: psycopg, psycopg_pool, pgvector, pydantic. Можно
-скопировать во внешний проект и пользоваться, передав свои llm/embedder/DSN.
+только внешние библиотеки: psycopg, pydantic. Можно скопировать во внешний
+проект и пользоваться, передав свои llm/embedder/DSN.
+
+NB: PostgreSQL должна иметь установленное расширение pgvector (на стороне БД),
+чтобы тип `vector(2560)` и оператор `<=>` существовали. Это не Python-зависимость.
 
 Использование:
 
@@ -51,10 +54,7 @@ from datetime import datetime, timezone
 from typing import Any, Iterator, Protocol, TypeVar, runtime_checkable
 
 import psycopg
-from pgvector import Vector
-from pgvector.psycopg import register_vector
 from psycopg.rows import dict_row
-from psycopg_pool import ConnectionPool
 from pydantic import BaseModel, Field
 
 T = TypeVar("T", bound=BaseModel)
@@ -85,49 +85,45 @@ class LLM(Protocol):
 
 
 # ---------------------------------------------------------------------------
-# Inline Postgres helpers (без зависимости от rag_v7_wiki.dao.connection).
+# Inline Postgres helpers — без psycopg_pool и без pgvector библиотеки.
+# Векторы передаются как текст (формат '[v1,v2,...]') и кастуются ::vector
+# в SQL — это понимает расширение pgvector на стороне БД.
 # ---------------------------------------------------------------------------
 
 
-def _to_vec(values: list[float] | None) -> Vector | None:
-    return None if values is None else Vector(values)
+def _to_vec(values: list[float] | None) -> str | None:
+    """Сериализует list[float] в pgvector text-формат '[v1,v2,...]'.
+
+    Используется как параметр %s в SQL — будет передано как строковый литерал
+    и приведено к типу vector через ::vector каст в самом SQL.
+    """
+    if values is None:
+        return None
+    return "[" + ",".join(repr(float(v)) for v in values) + "]"
 
 
 class _ConnectionManager:
-    """Read-only обёртка над psycopg ConnectionPool с регистрацией pgvector.
+    """Минимальная обёртка: открывает новое psycopg-соединение per call.
 
-    Принимает либо DSN-строку (создаёт собственный pool, закрывает в close()),
-    либо готовый ConnectionPool (внешним владельцем не управляем).
+    Без psycopg_pool — никакого пуллинга. Если нужна оптимизация через пул —
+    оберни DSN в свой пул и переопредели conn() в подклассе.
     """
 
-    def __init__(self, dsn_or_pool: str | ConnectionPool):
-        if isinstance(dsn_or_pool, ConnectionPool):
-            self._pool = dsn_or_pool
-            self._owned = False
-        else:
-            self._pool = ConnectionPool(
-                conninfo=dsn_or_pool,
-                min_size=1,
-                max_size=10,
-                kwargs={"row_factory": dict_row},
-                configure=self._configure_connection,
-                open=True,
+    def __init__(self, dsn: str):
+        if not isinstance(dsn, str):
+            raise TypeError(
+                "db_connection_string must be a DSN string (psycopg_pool dependency removed)"
             )
-            self._owned = True
-
-    @staticmethod
-    def _configure_connection(conn: psycopg.Connection) -> None:
-        register_vector(conn)
+        self._dsn = dsn
 
     @contextmanager
     def conn(self) -> Iterator[psycopg.Connection]:
-        with self._pool.connection() as conn:
-            register_vector(conn)
+        with psycopg.connect(self._dsn, row_factory=dict_row) as conn:
             yield conn
 
     def close(self) -> None:
-        if self._owned:
-            self._pool.close()
+        # Соединения короткоживущие, нечего закрывать на уровне менеджера.
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -336,7 +332,7 @@ class KnowledgeExtractor:
         self,
         llm: LLM,
         embedder: Embedder,
-        db_connection_string: str | ConnectionPool,
+        db_connection_string: str,
         *,
         # entity-resolution
         entity_top_k: int = 8,
@@ -1549,10 +1545,10 @@ class KnowledgeExtractor:
                 """
                 SELECT id, entity_type, canonical_name, salient_attrs,
                        mention_count, confidence,
-                       1 - (canonical_name_embedding <=> %s) AS similarity
+                       1 - (canonical_name_embedding <=> %s::vector) AS similarity
                 FROM rag_v7.entities
                 WHERE direction_key = %s
-                ORDER BY canonical_name_embedding <=> %s
+                ORDER BY canonical_name_embedding <=> %s::vector
                 LIMIT %s;
                 """,
                 (q, direction_key, q, k),
@@ -1611,14 +1607,14 @@ class KnowledgeExtractor:
                        c.last_confirmed_at, c.subject_entity_id, c.object_entity_id,
                        e1.canonical_name AS subject_name,
                        COALESCE(e2.canonical_name, c.object_text) AS object_repr,
-                       1 - (c.claim_embedding <=> %s) AS similarity
+                       1 - (c.claim_embedding <=> %s::vector) AS similarity
                 FROM rag_v7.claims c
                 JOIN rag_v7.entities e1 ON e1.id = c.subject_entity_id
                 LEFT JOIN rag_v7.entities e2 ON e2.id = c.object_entity_id
                 WHERE c.direction_key = %s
                   AND c.status::text = ANY(%s)
                   AND (c.subject_entity_id = %s OR c.object_entity_id = %s)
-                ORDER BY c.claim_embedding <=> %s
+                ORDER BY c.claim_embedding <=> %s::vector
                 LIMIT %s;
                 """,
                 (
@@ -1648,13 +1644,13 @@ class KnowledgeExtractor:
                        c.last_confirmed_at, c.subject_entity_id, c.object_entity_id,
                        e1.canonical_name AS subject_name,
                        COALESCE(e2.canonical_name, c.object_text) AS object_repr,
-                       1 - (c.claim_embedding <=> %s) AS similarity
+                       1 - (c.claim_embedding <=> %s::vector) AS similarity
                 FROM rag_v7.claims c
                 JOIN rag_v7.entities e1 ON e1.id = c.subject_entity_id
                 LEFT JOIN rag_v7.entities e2 ON e2.id = c.object_entity_id
                 WHERE c.direction_key = %s
                   AND c.status::text = ANY(%s)
-                ORDER BY c.claim_embedding <=> %s
+                ORDER BY c.claim_embedding <=> %s::vector
                 LIMIT %s;
                 """,
                 (q, direction_key, list(_ACTIVE_STATUSES), q, pool_size),
@@ -1673,11 +1669,11 @@ class KnowledgeExtractor:
                 """
                 SELECT id, page_kind::text AS page_kind, slug, title, content_md,
                        quality_score, coverage_claims, coverage_contradictions,
-                       1 - (content_embedding <=> %s) AS similarity
+                       1 - (content_embedding <=> %s::vector) AS similarity
                 FROM rag_v7.wiki_pages
                 WHERE direction_key = %s
                   AND page_kind::text = ANY(%s)
-                ORDER BY content_embedding <=> %s
+                ORDER BY content_embedding <=> %s::vector
                 LIMIT %s;
                 """,
                 (q, direction_key, self.include_page_kinds, q, pool_size),
@@ -1875,7 +1871,7 @@ class KnowledgeExtractor:
                            c.subject_entity_id, c.object_entity_id,
                            e1.canonical_name AS subject_name,
                            COALESCE(e2.canonical_name, c.object_text) AS object_repr,
-                           1 - (c.claim_embedding <=> %s) AS similarity
+                           1 - (c.claim_embedding <=> %s::vector) AS similarity
                     FROM rag_v7.claims c
                     JOIN rag_v7.entities e1 ON e1.id = c.subject_entity_id
                     LEFT JOIN rag_v7.entities e2 ON e2.id = c.object_entity_id
