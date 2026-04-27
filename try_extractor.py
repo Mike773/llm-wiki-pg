@@ -110,8 +110,16 @@ def main() -> None:
                 ).fetchone()
                 print(f"[doc] status={row[0]}")
 
-        # --- extract через KnowledgeExtractor (standalone, наш модуль)
-        with KnowledgeExtractor(llm, embedder, dsn) as kx:
+        # --- extract через KnowledgeExtractor (standalone, наш модуль).
+        # Передаём ДВЕ callable'ы — а не Embedder/LLM объекты. Тонкие лямбды
+        # поверх OpenAIEmbedder.embed / OpenAILLM.complete.
+        def get_embedding(text: str) -> list[float]:
+            return embedder.embed([text])[0]
+
+        def get_llm(system_prompt: str, prompt: str) -> str:
+            return llm.complete(system_prompt, prompt)
+
+        with KnowledgeExtractor(get_llm, get_embedding, dsn, llm_label="gpt-4o-mini") as kx:
 
             cases = [
                 # 1. Должен матчить Андрея Карпати, инструкция про его роли
